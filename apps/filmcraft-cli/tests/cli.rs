@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn cli(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_filmcraft-cli")).args(args).output().expect("spawn filmcraft-cli")
@@ -22,6 +22,35 @@ fn help_and_usage_errors() {
     assert_eq!(cli(&[]).status.code(), Some(2));
     assert_eq!(cli(&["frobnicate"]).status.code(), Some(2));
     assert_eq!(cli(&["exec", "file.newBin", "notkv"]).status.code(), Some(2));
+    // Invalid --bridge is a usage error (exit 2) for both exec and mcp (#921).
+    assert_eq!(cli(&["--bridge", "0.0.0.0:9876", "exec", "inspect.project"]).status.code(), Some(2));
+    assert_eq!(cli(&["mcp", "--bridge", "0.0.0.0:9876"]).status.code(), Some(2));
+}
+
+#[test]
+fn version_after_global_options() {
+    let want = format!("filmcraft-cli {}\n", env!("CARGO_PKG_VERSION"));
+    for args in [&["--version"][..], &["-V"], &["version"], &["--demo", "--version"], &["--compact", "-V"], &["--demo", "version"]] {
+        let o = cli(args);
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(String::from_utf8_lossy(&o.stdout), want, "{args:?}");
+    }
+}
+
+#[test]
+fn long_help_matches_help_command() {
+    let reference = cli(&["help"]);
+    assert!(reference.status.success());
+    let long_help = cli(&["--help"]);
+    assert!(long_help.status.success(), "--help failed: {}", String::from_utf8_lossy(&long_help.stderr));
+    assert_eq!(long_help.stdout, reference.stdout);
+    assert!(long_help.stderr.is_empty());
+    let short_help = cli(&["-h"]);
+    assert!(short_help.status.success());
+    assert_eq!(short_help.stdout, reference.stdout);
+    let sub_help = cli(&["export", "--help"]);
+    assert!(sub_help.status.success(), "export --help failed: {}", String::from_utf8_lossy(&sub_help.stderr));
+    assert_eq!(sub_help.stdout, reference.stdout);
 }
 
 #[test]
@@ -118,6 +147,23 @@ fn export_wav_waits_for_job() {
     let o = cli(&["--demo", "export", out.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(std::fs::metadata(&out).map(|m| m.len() > 44).unwrap_or(false));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_waits_for_an_export_on_its_last_line() {
+    // #2342: `file.exportMedia` as the last line of a script is written before `run` exits
+    let dir = std::env::temp_dir().join(format!("fc-cli-run-x-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("last.wav");
+    // `"wait": null` waits too: only an explicit `false` doesn't
+    let script = json!({"id": "file.exportMedia", "params": {"path": out.to_str().unwrap(), "format": "wav", "wait": null}}).to_string();
+    let mut child =
+        Command::new(env!("CARGO_BIN_EXE_filmcraft-cli")).args(["--demo", "run", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(format!("{script}\n").as_bytes()).unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    assert!(std::fs::metadata(&out).map(|m| m.len() > 44).unwrap_or(false), "{}", String::from_utf8_lossy(&o.stdout));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -263,5 +309,78 @@ fn closed_stdout_still_runs_the_script_and_saves() {
         b"{\"id\":\"no.such.command\"}\n{\"id\":\"file.newBin\",\"params\":{\"name\":\"x\"}}\n",
     );
     assert_eq!(out.status.code(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `render` with a non-numeric or non-finite `--seconds` / `--scale` is a usage error (exit 2) and
+/// writes nothing, instead of silently rendering frame 0 at full scale.
+#[test]
+fn render_rejects_bad_numbers() {
+    let dir = std::env::temp_dir().join(format!("fc-cli-render-nan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let still = dir.join("s.png").to_str().unwrap().to_string();
+    for (opt, bad) in
+        [("--seconds", "1s"), ("--seconds", "1,5"), ("--seconds", "abc"), ("--seconds", "NaN"), ("--seconds", "inf"), ("--scale", "xyz"), ("--scale", "NaN")]
+    {
+        let (secs, scale) = if opt == "--seconds" { (bad, "0.1") } else { ("1", bad) };
+        let o = cli(&["--demo", "render", "--seconds", secs, "--scale", scale, "--out", &still]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{opt} {bad}: {err}");
+        assert!(err.contains("filmcraft-cli:") && err.contains(opt), "{opt} {bad}: {err}");
+        assert!(!std::path::Path::new(&still).exists(), "{opt} {bad} wrote a file");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #1054: exporting or rendering a project whose media is missing fails (exit 1) and names the
+/// offline items on stderr and in the result's `offlineMedia`, unless `--allow-offline` accepts the
+/// placeholder frames; then it still warns.
+#[test]
+fn export_with_missing_media_fails_unless_allowed() {
+    let dir = std::env::temp_dir().join(format!("fc-cli-1054-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    let (still, proj) = (f("still.png"), f("p.fcproj"));
+    let o = cli(&["--demo", "render", "--seconds", "1", "--scale", "0.1", "--out", &still]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    json_out(&cli(&["exec", "file.newSequence", "name=s", "width=64", "height=36", "fps=24", "--save-as", &proj]));
+    let paths = format!("paths=[\"{}\"]", still.replace('\\', "\\\\"));
+    let item = json_out(&cli(&["--project", &proj, "--save", "exec", "file.import", &paths]))["items"][0].as_u64().unwrap();
+    json_out(&cli(&["--project", &proj, "--save", "exec", "timeline.place", &format!("item={item}"), "track=V1", "frame=0", "audio=false"]));
+    let export = |out: &str, extra: &[&str]| {
+        let mut args = vec!["--project", proj.as_str(), "--compact", "export", out, "--format", "png", "--start", "0", "--end", "0.05"];
+        args.extend_from_slice(extra);
+        cli(&args)
+    };
+
+    let on = export(&f("on.png"), &[]);
+    let v = json_out(&on);
+    assert_eq!(v["offlineMedia"], serde_json::json!([]), "{v}");
+    assert!(!String::from_utf8_lossy(&on.stderr).contains("warning"), "{}", String::from_utf8_lossy(&on.stderr));
+
+    std::fs::remove_file(&still).unwrap();
+    let off = export(&f("off.png"), &[]);
+    let err = String::from_utf8_lossy(&off.stderr);
+    assert_eq!(off.status.code(), Some(1), "{err}");
+    assert!(err.contains("still.png") && err.contains("missing") && err.contains("--allow-offline"), "{err}");
+    let v: Value = serde_json::from_slice(&off.stdout).expect("the result JSON is still printed");
+    assert_eq!(v["offlineMedia"][0]["item"], item, "{v}");
+    assert_eq!(v["offlineMedia"][0]["status"], "missing", "{v}");
+
+    let allowed = export(&f("allowed.png"), &["--allow-offline"]);
+    let err = String::from_utf8_lossy(&allowed.stderr);
+    assert!(allowed.status.success(), "{err}");
+    assert!(err.contains("still.png") && err.contains("missing"), "still warns: {err}");
+    assert_eq!(json_out(&allowed)["offlineMedia"][0]["status"], "missing");
+
+    let render = cli(&["--project", &proj, "render", "--seconds", "0", "--out", &f("r.png")]);
+    let err = String::from_utf8_lossy(&render.stderr);
+    assert_eq!(render.status.code(), Some(1), "{err}");
+    assert!(err.contains("still.png") && err.contains("--allow-offline"), "{err}");
+    let render = cli(&["--project", &proj, "render", "--seconds", "0", "--out", &f("r.png"), "--allow-offline"]);
+    assert!(render.status.success(), "{}", String::from_utf8_lossy(&render.stderr));
+    assert!(String::from_utf8_lossy(&render.stderr).contains("still.png"));
     let _ = std::fs::remove_dir_all(&dir);
 }

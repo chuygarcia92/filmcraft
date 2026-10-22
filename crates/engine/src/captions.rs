@@ -299,7 +299,15 @@ pub fn commands() -> Vec<CommandSpec> {
             r##"{"track":id|"C1","font":str?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"reset":bool?}"##,
             has_caption_track,
             |s, p| {
-                let tid = track_param(s, p).ok_or_else(|| bad("captions.setStyle", "no such caption track"))?;
+                let tid = track_param(s, p).ok_or_else(|| {
+                    bad(
+                        "captions.setStyle",
+                        format!(
+                            "no such caption track ({}) — pass the track id from captions.list, or \"C1\"…",
+                            p.get("track").map(|v| v.to_string()).unwrap_or_else(|| "no `track` given".into())
+                        ),
+                    )
+                })?;
                 let p = p.clone();
                 s.edit("Caption Style", |pr, st| {
                     let seq = st.active_sequence.ok_or(EngineError::NoSequence)?;
@@ -513,7 +521,11 @@ pub fn commands() -> Vec<CommandSpec> {
             enabled: always,
             run: |s, p| {
                 let Some(seq) = s.active_sequence() else { return Ok(json!({"tracks": []})) };
-                let only = p.get("track").and_then(|_| track_param(s, p));
+                // a `track` that names no caption track is an error, never every track
+                let only = match p.get("track") {
+                    Some(_) => Some(track_param(s, p).ok_or_else(|| bad("captions.list", "no such caption track"))?),
+                    None => None,
+                };
                 let tracks: Vec<Value> =
                     seq.caption_tracks.iter().enumerate().filter(|(_, t)| only.is_none_or(|o| o == t.id)).map(|(i, t)| track_json(s, t, i)).collect();
                 Ok(json!({"tracks": tracks, "selection": s.state.caption_selection.iter().map(|c| c.0).collect::<Vec<_>>()}))
